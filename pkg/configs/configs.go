@@ -4,22 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"gateway/pkg/cos"
 	"gateway/pkg/version"
 	"io"
-	"log"
 	"net/http"
-	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
 var (
-	Entry            = EntryConfig{}
-	EntryConfigStore atomic.Value
-	metaDataCache    sync.Map
+	Entry         = EntryConfig{}
+	metaDataCache sync.Map
 
 	ErrorNeedCosFilePathOfEntry = errors.New("need cos file path of entry")
 	ErrorEmptyEntryConfig       = errors.New("empty entry config")
@@ -52,45 +46,13 @@ type NodeInfoConfig struct {
 }
 
 type EntryConfig struct {
-	Dev struct {
-		Discovery DiscoveryConfig `json:"discovery"`
-		NodeInfo  NodeInfoConfig  `json:"node_info"`
-	} `json:"dev,omitempty"`
-
-	Debug struct {
-		Discovery DiscoveryConfig `json:"discovery"`
-		NodeInfo  NodeInfoConfig  `json:"node_info"`
-	} `json:"debug,omitempty"`
-
-	Release struct {
-		Discovery DiscoveryConfig `json:"discovery"`
-		NodeInfo  NodeInfoConfig  `json:"node_info"`
-	} `json:"release,omitempty"`
-
-	CosBasePath  string `json:"cos_base_path"`
-	CosFilePath  string `json:"cos_file_path"`
-	CosSecretID  string `json:"-"`
-	CosSecretKey string `json:"-"`
-	Etag         string `json:"etag"`
-	UpdateTime   string `json:"update_time"`
-	Env          string `json:"env"`
+	Discovery DiscoveryConfig `json:"discovery"`
+	NodeInfo  NodeInfoConfig  `json:"node_info"`
+	Env       string          `json:"env"`
 }
 
-func Watch(interval time.Duration, alert func(string)) error {
-	EntryConfigStore.Store(Entry)
-
+func Init() error {
 	// Load node information on first startup
-	if err := LoadNodeInfo(); err != nil {
-		return err
-	}
-	EntryConfigStore.Store(Entry)
-
-	// Load entry configuration on first startup
-	if err := LoadEntry(); err != nil {
-		return err
-	}
-
-	// Override node information
 	if err := LoadNodeInfo(); err != nil {
 		return err
 	}
@@ -99,60 +61,6 @@ func Watch(interval time.Duration, alert func(string)) error {
 	if err := validate(); err != nil {
 		return err
 	}
-
-	EntryConfigStore.Store(Entry)
-
-	// Use COS configuration in production environment
-	if version.ENV == version.EnvDev {
-		return nil
-	}
-
-	// Listen for remote configuration changes
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				alert(fmt.Sprintf("update config panic: %v stack: %s", r, string(debug.Stack())))
-			}
-		}()
-
-		c := cos.New(Entry.CosBasePath, Entry.CosSecretID, Entry.CosSecretKey)
-		for {
-			time.Sleep(interval)
-
-			etag, err := c.Head(Entry.CosFilePath)
-			if err != nil {
-				alert("cos sdk head fail: " + err.Error())
-			} else {
-				if etag != "" && Entry.Etag != etag {
-					if err := LoadEntry(); err != nil {
-						alert("update entry config fail: " + err.Error())
-						continue
-					}
-
-					if err := LoadNodeInfo(); err != nil {
-						alert("update node info fail: " + err.Error())
-						continue
-					}
-
-					if err := validate(); err != nil {
-						alert("validate config fail: " + err.Error())
-						continue
-					}
-
-					// 拷贝
-					EntryConfigStore.Store(Entry)
-
-					nodeInfo := GetNodeInfo()
-					discoveryInfo := GetDiscovery()
-					discoveryInfo.RedisPassword = "***"
-					strNodeInfo, _ := json.MarshalIndent(nodeInfo, "", "	")
-					strDiscoveryInfo, _ := json.MarshalIndent(discoveryInfo, "", "	")
-					alert("update node info:\n" + string(strNodeInfo) + "\n\nupdate discovery info:\n" + string(strDiscoveryInfo))
-				}
-			}
-
-		}
-	}()
 
 	return nil
 }
@@ -163,60 +71,14 @@ func validate() error {
 	return nil
 }
 
-func InitLogFormat() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-}
+func Show() string {
+	nodeInfo := GetNodeInfo()
+	discoveryInfo := GetDiscovery()
 
-// Load entry configuration
-func LoadEntry() error {
-	Entry.Env = version.ENV
-	if version.ENV == version.EnvDebug {
-		Entry.CosBasePath = "https://xxxx.myqcloud.com"
-		Entry.CosSecretID = "xxxx"
-		Entry.CosSecretKey = "xxxx"
-	}
-
-	if version.ENV == version.EnvRelease {
-		Entry.CosBasePath = "https://xxxx.myqcloud.com"
-		Entry.CosSecretID = "xxxx"
-		Entry.CosSecretKey = "xxxx"
-	}
-
-	// Use only remote configuration in debug and release environments
-	if version.ENV == version.EnvDebug || version.ENV == version.EnvRelease {
-		Entry.CosFilePath = strings.TrimSpace(Entry.CosFilePath)
-		if Entry.CosFilePath == "" {
-			return ErrorNeedCosFilePathOfEntry
-		}
-
-		c := cos.New(Entry.CosBasePath, Entry.CosSecretID, Entry.CosSecretKey)
-		data, etag, err := c.Get(Entry.CosFilePath)
-		if err != nil {
-			return err
-		}
-
-		Entry.Etag = etag
-		Entry.UpdateTime = time.Now().Format(time.DateTime)
-
-		if len(data) == 0 {
-			return ErrorEmptyEntryConfig
-		}
-
-		if version.ENV == version.EnvDebug {
-			if err = json.Unmarshal(data, &Entry.Debug); err != nil {
-				return err
-			}
-		}
-
-		if version.ENV == version.EnvRelease {
-			if err = json.Unmarshal(data, &Entry.Release); err != nil {
-				return err
-			}
-		}
-	}
-
-	// dev配置
-	return nil
+	strNodeInfo, _ := json.MarshalIndent(nodeInfo, "", "	")
+	discoveryInfo.RedisPassword = "***"
+	strdiscoveryInfo, _ := json.MarshalIndent(discoveryInfo, "", "	")
+	return fmt.Sprintf("load node info:\n%s\n\nload discovery info:\n%s\n", string(strNodeInfo), string(strdiscoveryInfo))
 }
 
 // Set node information
@@ -242,38 +104,14 @@ func LoadNodeInfo() error {
 		return err
 	}
 
-	if version.ENV == version.EnvDev {
-		Entry.Dev.NodeInfo.Env = version.EnvDev
-		Entry.Dev.NodeInfo.PublicIP = publicIP
-		Entry.Dev.NodeInfo.LocalIP = localIP
-		Entry.Dev.NodeInfo.InstanceName = instanceName
-		Entry.Dev.NodeInfo.InstanceID = instanceID
-		Entry.Dev.NodeInfo.ID = fmt.Sprintf("%s_%d_%d", instanceID, Entry.Dev.NodeInfo.PublicTcpPort, Entry.Dev.NodeInfo.PrivateHttpPort)
-		Entry.Dev.NodeInfo.BuildVersion = version.BUILD_DATE
-		Entry.Dev.NodeInfo.GitVersion = version.VERSION
-	}
-
-	if version.ENV == version.EnvDebug {
-		Entry.Debug.NodeInfo.Env = version.EnvDebug
-		Entry.Debug.NodeInfo.PublicIP = publicIP
-		Entry.Debug.NodeInfo.LocalIP = localIP
-		Entry.Debug.NodeInfo.InstanceName = instanceName
-		Entry.Debug.NodeInfo.InstanceID = instanceID
-		Entry.Debug.NodeInfo.ID = fmt.Sprintf("%s_%d_%d", instanceID, Entry.Debug.NodeInfo.PublicTcpPort, Entry.Debug.NodeInfo.PrivateHttpPort)
-		Entry.Debug.NodeInfo.BuildVersion = version.BUILD_DATE
-		Entry.Debug.NodeInfo.GitVersion = version.VERSION
-	}
-
-	if version.ENV == version.EnvRelease {
-		Entry.Release.NodeInfo.Env = version.EnvRelease
-		Entry.Release.NodeInfo.PublicIP = publicIP
-		Entry.Release.NodeInfo.LocalIP = localIP
-		Entry.Release.NodeInfo.InstanceName = instanceName
-		Entry.Release.NodeInfo.InstanceID = instanceID
-		Entry.Release.NodeInfo.ID = fmt.Sprintf("%s_%d_%d", instanceID, Entry.Release.NodeInfo.PublicTcpPort, Entry.Release.NodeInfo.PrivateHttpPort)
-		Entry.Release.NodeInfo.BuildVersion = version.BUILD_DATE
-		Entry.Release.NodeInfo.GitVersion = version.VERSION
-	}
+	Entry.NodeInfo.Env = version.ENV
+	Entry.NodeInfo.PublicIP = publicIP
+	Entry.NodeInfo.LocalIP = localIP
+	Entry.NodeInfo.InstanceName = instanceName
+	Entry.NodeInfo.InstanceID = instanceID
+	Entry.NodeInfo.ID = fmt.Sprintf("%s_%d_%d", instanceID, Entry.NodeInfo.PublicTcpPort, Entry.NodeInfo.PrivateHttpPort)
+	Entry.NodeInfo.BuildVersion = version.BUILD_DATE
+	Entry.NodeInfo.GitVersion = version.VERSION
 
 	return nil
 }
@@ -305,29 +143,9 @@ func get(url string) (string, error) {
 }
 
 func GetNodeInfo() NodeInfoConfig {
-	config := EntryConfigStore.Load().(EntryConfig)
-
-	if version.ENV == version.EnvDebug {
-		return config.Debug.NodeInfo
-	}
-
-	if version.ENV == version.EnvRelease {
-		return config.Release.NodeInfo
-	}
-
-	return config.Dev.NodeInfo
+	return Entry.NodeInfo
 }
 
 func GetDiscovery() DiscoveryConfig {
-	config := EntryConfigStore.Load().(EntryConfig)
-
-	if version.ENV == version.EnvDebug {
-		return config.Debug.Discovery
-	}
-
-	if version.ENV == version.EnvRelease {
-		return config.Release.Discovery
-	}
-
-	return config.Dev.Discovery
+	return Entry.Discovery
 }
